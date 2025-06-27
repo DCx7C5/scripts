@@ -183,7 +183,7 @@ EOF
   echo "Created CSR ${srvcsr} ✅"
 }
 
-sign_srvcsr() {
+sign_csr() {
   if [[ $# -ne 4 ]]; then echo -e "wrong number of args\norder: srvcsr,ca,cakey,certout";return 1 ;fi
   local srvcsr="$1" ca="$2" cakey="$3" certout="$4"
   openssl x509 -req -sha256 -days 365 \
@@ -248,7 +248,7 @@ install_docker_certs() {
   # Create Server Csr
   create_cert_signing_request "$srvkey" "$srvcsr" "localhost,127.0.0.1" "serverAuth"
   # Sign Server Csr
-  sign_srvcsr "$srvcsr" "$ca" "$cakey" "$srvcrt"
+  sign_csr "$srvcsr" "$ca" "$cakey" "$srvcrt"
 
   USER=${USER:-"$(whoami)"}
 
@@ -257,7 +257,7 @@ install_docker_certs() {
   # Create client srvcsr
   create_cert_signing_request "$clikey" "$clicsr" "$USER" "clientAuth"
   # Sign client srvcsr
-  sign_srvcsr "$clicsr" "$ca" "$cakey" "$clicrt"
+  sign_csr "$clicsr" "$ca" "$cakey" "$clicrt"
 
   [[ ! -d $dockdir ]] && mkdir "$dockdir" && chmod 750 "$dockdir"
 
