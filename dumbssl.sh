@@ -17,7 +17,7 @@ help() {
   echo "    --key <file>             (Required) Path to the private key."
   echo "    --out <file>             (Required) Output file for the CSR."
   echo "    --domains <list>         (Required) Comma-separated list of domains/IPs."
-  echo "    --auth <type>            (Optional) Extended key usage. Default: clientAuth"
+  echo "    --type <type>            (Required) Extended key usage. One of (server, client)"
   echo ""
   echo "  sign-csr                 Signs a CSR with a CA."
   echo "    --csr <file>             (Required) Path to the CSR file to sign."
@@ -63,18 +63,29 @@ main() {
       create_sslprivatekey "$out"
       ;;
     create-csr)
-      local key out domains auth="clientAuth"
+      local key out domains type
       while [[ $# -gt 0 ]]; do
         case "$1" in
           --key) key="$2"; shift 2;;
           --out) out="$2"; shift 2;;
           --domains) domains="$2"; shift 2;;
-          --auth) auth="$2"; shift 2;;
+          --type)
+            if [[ "$2" == "server" ]]; then
+              type="serverAuth"
+            elif [[ "$2" == "client" ]]; then
+              type="clientAuth"
+            else
+              echo "Unknown option: $2"
+              help
+              exit 1
+            fi;
+            shift 2
+            ;;
           *) echo "Unknown option: $1"; help; exit 1;;
         esac
       done
-      if [[ -z "$key" || -z "$out" || -z "$domains" ]]; then echo "Error: --key, --out, and --domains are required."; help; exit 1; fi
-      create_cert_signing_request "$key" "$out" "$domains" "$auth"
+      if [[ -z "$key" || -z "$out" || -z "$domains" || -z "$type" ]]; then echo "Error: --key, --out, and --domains are required."; help; exit 1; fi
+      create_cert_signing_request "$key" "$out" "$domains" "$type"
       ;;
     sign-csr)
       local csr ca cakey certout
@@ -216,7 +227,7 @@ EOF
 install_docker_certs() {
   local srvkey="server-key.pem" srvcsr="server.csr" ca="ca.pem" \
     cakey="ca-key.pem" srvcrt="server-cert.pem" clikey="key.pem" \
-    clicsr="cli.csr" clicrt="cert.pem" dockdir
+    clicsr="cli.csr" clicrt="cert.pem" dockdir="$HOME/.docker"
 
   # Create docker ca
   create_rootca 'Docker CA'
@@ -248,7 +259,6 @@ install_docker_certs() {
   # Sign client srvcsr
   sign_srvcsr "$clicsr" "$ca" "$cakey" "$clicrt"
 
-  dockdir="/home/$USER/.docker"
   [[ ! -d $dockdir ]] && mkdir "$dockdir" && chmod 750 "$dockdir"
 
   echo "Moving Server certs...."
@@ -263,9 +273,8 @@ install_docker_certs() {
 
   chown -R "${USER}":"${USER}" "$dockdir"
   chmod 600 "/etc/docker/tls/*"
-  chmod 600 "$dockdir/key.pem"
-  chmod 600 "$dockdir/cert.pem"
-  chmod 600 "$dockdir/ca.pem"
+  chmod 600 "$dockdir/*.pem"
+
 
   # Calling function to set daemon.json
   set_docker_daemonjson "/etc/docker/daemon.json"
@@ -275,7 +284,6 @@ install_docker_certs() {
 
 set_docker_daemonjson() {
   local daemonfile="$1"
-  # Ensure file exists and is valid JSON
   [[ ! -f "$daemonfile" ]] && echo "{}" > "$daemonfile"
 
   jq \
