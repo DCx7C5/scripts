@@ -25,8 +25,9 @@ help() {
   echo "    --ca-key <file>          (Required) Path to the CA private key."
   echo "    --out <file>             (Required) Output file for the new certificate."
   echo ""
-  echo "  install-docker-certs     A command to automatically create a CA, server certs,"
-  echo "                           and client certs, and install them for Docker."
+  echo "  install-docker-certs     A command to automatically create a CA, server certs, and client certs"
+  echo "    --user <username>        (Required) Set client cert user"
+  echo "    --caout <directory>      (Optional) Path to CA output directory. Default: ./"
   echo ""
   echo "  help                     Shows this help message."
 }
@@ -99,10 +100,18 @@ main() {
         esac
       done
       if [[ -z "$csr" || -z "$ca" || -z "$cakey" || -z "$certout" ]]; then echo "Error: --csr, --ca, --ca-key, and --out are required."; help; exit 1; fi
-      sign_srvcsr "$csr" "$ca" "$cakey" "$certout"
+      sign_csr "$csr" "$ca" "$cakey" "$certout"
       ;;
     install-docker-certs)
-      install_docker_certs
+      local user caout
+      while [[ $# -gt 0 ]]; do
+        case "$1" in
+          --user) user="$2"; shift 2;;
+          --caout) caout="$2"; shift 2;;
+        esac
+      done
+      if [[ -z "$user" ]]; then echo "Error: --user is required."; help; exit 1; fi
+      install_docker_certs "$user" "${caout:-""}"
       ;;
     help|--help|-h)
       help
@@ -213,11 +222,11 @@ create_rootca() {
   basicConstraints = critical,CA:true
   keyUsage = critical,digitalSignature,cRLSign,keyCertSign
 EOF
-  openssl ecparam -name prime256v1 -genkey -noout -out "ca-key.pem"
+  openssl ecparam -name prime256v1 -genkey -noout -out ca-key.pem
   openssl req -new -x509 -sha256 -days 730 \
-      -key "ca-key.pem" \
+      -key ca-key.pem \
       -nodes \
-      -out "ca.pem" \
+      -out ca.pem \
       -config ca_openssl.cnf
   rm ca_openssl.cnf
   echo "Created Docker CA ✅"
@@ -227,35 +236,38 @@ EOF
 install_docker_certs() {
   local srvkey="server-key.pem" srvcsr="server.csr" ca="ca.pem" \
     cakey="ca-key.pem" srvcrt="server-cert.pem" clikey="key.pem" \
-    clicsr="cli.csr" clicrt="cert.pem" dockdir="$HOME/.docker"
+    clicsr="cli.csr" clicrt="cert.pem" \
+    user="$1" caout="$2" dockdir="/home/$1/.docker"
+
+  if [[ $user == "root" ]]; then
+    dockdir="/root/.docker"
+  fi
 
   # Create docker ca
   create_rootca 'Docker CA'
 
-  # Copy to project dir if PROJECT_DIR is set
-  if [[ -n $PROJECT_DIR ]]; then
-    CADIR="$PROJECT_DIR/.certs/ssl/docker-ca"
-    [[ ! -d $CADIR ]] && mkdir -p "$CADIR" && chmod 700 "$CADIR"
-    echo "Copying Docker CA to project dir"
-    cp "$ca" "$CADIR/$ca"
-    cp "$cakey" "$CADIR/$cakey"
-    chmod 600 "$CADIR/$ca"
-    chmod 600 "$CADIR/$cakey"
+  # Copy to caout dir if is set
+  if [[ -n $caout ]]; then
+    [[ ! -d $caout ]] && mkdir -p "$caout" && chmod 700 "$caout"
+    cp "$ca" "$caout/$ca"
+    cp "$cakey" "$caout/$cakey"
+    chmod 600 "$caout/$ca"
+    chmod 600 "$caout/$cakey"
+    chown "$user":"$user" -R "$caout"
+    echo "Copied Docker CA to ca out dir ✅"
   fi
 
   # Create Server key
   create_sslprivatekey "$srvkey"
   # Create Server Csr
-  create_cert_signing_request "$srvkey" "$srvcsr" "localhost,127.0.0.1" "serverAuth"
+  create_cert_signing_request "$srvkey" "$srvcsr" "localhost,host.docker.internal,172.17.0.1,127.0.0.1" "serverAuth"
   # Sign Server Csr
   sign_csr "$srvcsr" "$ca" "$cakey" "$srvcrt"
-
-  USER=${USER:-"$(whoami)"}
 
   # Create client key
   create_sslprivatekey "$clikey"
   # Create client srvcsr
-  create_cert_signing_request "$clikey" "$clicsr" "$USER" "clientAuth"
+  create_cert_signing_request "$clikey" "$clicsr" "$user" "clientAuth"
   # Sign client srvcsr
   sign_csr "$clicsr" "$ca" "$cakey" "$clicrt"
 
@@ -271,9 +283,10 @@ install_docker_certs() {
   mv "$clikey" "$dockdir/$clikey"
   cp "$ca" "$dockdir/$ca"
 
-  chown -R "${USER}":"${USER}" "$dockdir"
-  chmod 600 "/etc/docker/tls/*"
-  chmod 600 "$dockdir/*.pem"
+  chown -R "${user}":"${user}" "$dockdir"
+  chown -R "${user}":"${user}" "$"
+  chmod 400 "/etc/docker/tls/ca.pem" "/etc/docker/tls/server-cert.pem" "/etc/docker/tls/server-key.pem"
+  chmod 400 "$dockdir/ca.pem" "$dockdir/cert.pem" "$dockdir/key.pem"
 
 
   # Calling function to set daemon.json
@@ -285,9 +298,8 @@ install_docker_certs() {
 set_docker_daemonjson() {
   local daemonfile="$1"
   [[ ! -f "$daemonfile" ]] && echo "{}" > "$daemonfile"
-
   jq \
-    '.hosts = ["tcp://localhost:2376", "fd://"] |
+    '.hosts = ["tcp://127.0.0.1:2376", "tcp://172.17.0.1:2376"] |
      .tlscacert = "/etc/docker/tls/ca.pem" |
      .tlscert = "/etc/docker/tls/server-cert.pem" |
      .tlskey = "/etc/docker/tls/server-key.pem" |
@@ -296,7 +308,10 @@ set_docker_daemonjson() {
      .ipv6 = false |
      ."metrics-addr" = "127.0.0.1:9323" |
      .experimental = true' \
-    "$daemonfile" > "${daemonfile}.tmp" && mv "${daemonfile}.tmp" "$daemonfile"
+    "$daemonfile" > "${daemonfile}.tmp" \
+    && cp "${daemonfile}" "${daemonfile}.bkp" \
+    && echo "Backed up ${daemonfile} ✅" \
+    && mv "${daemonfile}.tmp" "$daemonfile"
   chmod 600 "$daemonfile"
   echo "Updated ${daemonfile} ✅"
 }
